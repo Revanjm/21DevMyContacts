@@ -1,0 +1,1732 @@
+const express = require("express");
+const http = require("http");
+const socketIo = require("socket.io");
+const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+   cors: {
+      origin: "*",
+      methods: ["GET", "POST"],
+   },
+});
+
+app.use(cors());
+app.use(express.json());
+
+// Хранилище подключенных пользователей
+const connectedUsers = new Map(); // userId -> socket.id
+const pendingCalls = new Map(); // callId -> callData
+const callHistory = new Map(); // userId -> [callHistory]
+const userFCMTokens = new Map(); // userId -> fcmToken
+
+// Константы
+const CALL_WAIT_TIMEOUT = 60000; // 60 секунд ожидания
+const MESSAGES_DIR = path.join(__dirname, "chats");
+const CALL_HISTORY_FILE = path.join(__dirname, "call_history.json");
+const FCM_TOKENS_FILE = path.join(__dirname, "fcm_tokens.json");
+
+// Создаем папку для сообщений если её нет
+if (!fs.existsSync(MESSAGES_DIR)) {
+   fs.mkdirSync(MESSAGES_DIR, { recursive: true });
+   console.log("📁 Created chats directory");
+}
+
+// Загрузка истории звонков
+function loadCallHistory() {
+   try {
+      if (fs.existsSync(CALL_HISTORY_FILE)) {
+         const data = fs.readFileSync(CALL_HISTORY_FILE, "utf8");
+         const history = JSON.parse(data);
+         for (const [userId, calls] of Object.entries(history)) {
+            callHistory.set(
+               userId,
+               new Map(calls.map((call) => [call.callId, call])),
+            );
+         }
+         console.log(`📞 Loaded call history for ${callHistory.size} users`);
+      }
+   } catch (error) {
+      console.error("❌ Error loading call history:", error.message, error.stack);
+   }
+}
+
+// Загрузка FCM токенов
+function loadFCMTokens() {
+   try {
+      if (fs.existsSync(FCM_TOKENS_FILE)) {
+         const data = fs.readFileSync(FCM_TOKENS_FILE, "utf8");
+         const tokens = JSON.parse(data);
+         for (const [userId, token] of Object.entries(tokens)) {
+            userFCMTokens.set(userId, token);
+         }
+         console.log(`📱 Loaded FCM tokens for ${userFCMTokens.size} users`);
+      }
+   } catch (error) {
+      console.error("❌ Error loading FCM tokens:", error.message, error.stack);
+   }
+}
+
+// Сохранение FCM токенов
+function saveFCMTokens() {
+   try {
+      const tokens = {};
+      for (const [userId, token] of userFCMTokens.entries()) {
+         tokens[userId] = token;
+      }
+      fs.writeFileSync(FCM_TOKENS_FILE, JSON.stringify(tokens, null, 2));
+   } catch (error) {
+      console.error("❌ Error saving FCM tokens:", error.message, error.stack);
+   }
+}
+
+// Сохранение истории звонков
+function saveCallHistory() {
+   try {
+      const history = {};
+      for (const [userId, calls] of callHistory.entries()) {
+         history[userId] = Array.from(calls.values());
+      }
+      fs.writeFileSync(CALL_HISTORY_FILE, JSON.stringify(history, null, 2));
+   } catch (error) {
+      console.error("❌ Error saving call history:", error.message, error.stack);
+   }
+}
+
+// Функция для отправки push-уведомления о звонке
+async function sendCallPushNotification(toUserId, callData) {
+   try {
+      const fcmToken = userFCMTokens.get(toUserId);
+
+      if (!fcmToken) {
+         console.log(`❌ No FCM token found for user ${toUserId}`);
+         return false;
+      }
+
+      // Здесь должна быть реализация отправки через FCM
+      // Для примера, создаем HTTP endpoint для получения push-уведомлений
+      console.log(`📱 Sending push notification to ${toUserId} about call from ${callData.callerId}`);
+
+      // В реальном приложении здесь будет код для FCM:
+      /*
+      const admin = require('firebase-admin');
+      const message = {
+        token: fcmToken,
+        notification: {
+          title: 'Входящий звонок',
+          body: `Вам звонит ${callData.contactName || callData.callerId}`,
+        },
+        data: {
+          type: 'incoming_call',
+          callId: callData.callId,
+          fromUserId: callData.callerId,
+          contactName: callData.contactName || callData.callerId,
+          timestamp: new Date().toISOString()
+        }
+      };
+
+      await admin.messaging().send(message);
+      */
+
+      // Временно используем HTTP endpoint для симуляции push
+      const pushData = {
+        toUserId: toUserId,
+        notification: {
+          title: 'Входящий звонок',
+          body: `Вам звонит ${callData.contactName || callData.callerId}`
+        },
+        data: {
+          type: 'incoming_call',
+          callId: callData.callId,
+          fromUserId: callData.callerId,
+          contactName: callData.contactName || callData.callerId,
+          timestamp: new Date().toISOString()
+        }
+      };
+
+      // Эмулируем отправку push (в реальности это будет FCM)
+      console.log(`📲 Push notification prepared for ${toUserId}:`, JSON.stringify(pushData));
+
+      return true;
+   } catch (error) {
+      console.error("❌ Error sending push notification:", error.message, error.stack);
+      return false;
+   }
+}
+
+// Функция для сохранения сообщения в файл
+function saveMessageToFile(chat_id, messageData) {
+   try {
+      const filePath = path.join(MESSAGES_DIR, `${chat_id}.json`);
+
+      let messages = [];
+
+      // Если файл существует, читаем существующие сообщения
+      if (fs.existsSync(filePath)) {
+         const fileContent = fs.readFileSync(filePath, "utf8");
+         try {
+            messages = JSON.parse(fileContent);
+            if (!Array.isArray(messages)) {
+               messages = [];
+            }
+         } catch (parseError) {
+            console.error(`❌ Error parsing ${filePath}:`, parseError.message);
+            messages = [];
+         }
+      }
+
+      // Добавляем новое сообщение
+      messages.push(messageData);
+
+      // Сохраняем обратно в файл
+      fs.writeFileSync(filePath, JSON.stringify(messages, null, 2));
+
+      console.log(
+         `💾 Message saved to ${chat_id}.json (total: ${messages.length} messages)`,
+      );
+      return true;
+   } catch (error) {
+      console.error(`❌ Error saving message to ${chat_id}.json:`, error.message, error.stack);
+      return false;
+   }
+}
+
+// Функция для загрузки сообщений из файла
+function loadMessagesFromFile(chat_id) {
+   try {
+      const filePath = path.join(MESSAGES_DIR, `${chat_id}.json`);
+
+      if (!fs.existsSync(filePath)) {
+         return [];
+      }
+
+      const fileContent = fs.readFileSync(filePath, "utf8");
+      const messages = JSON.parse(fileContent);
+
+      if (!Array.isArray(messages)) {
+         console.warn(
+            `⚠️ Invalid format in ${filePath}, returning empty array`,
+         );
+         return [];
+      }
+
+      console.log(`📂 Loaded ${messages.length} messages from ${chat_id}.json`);
+      return messages;
+   } catch (error) {
+      console.error(`❌ Error loading messages from ${chat_id}.json:`, error.message, error.stack);
+      return [];
+   }
+}
+
+// Функция для получения списка всех чатов
+function getAllChats() {
+   try {
+      const files = fs.readdirSync(MESSAGES_DIR);
+      return files
+         .filter((file) => file.endsWith(".json"))
+         .map((file) => file.replace(".json", ""));
+   } catch (error) {
+      console.error("❌ Error reading chats directory:", error.message, error.stack);
+      return [];
+   }
+}
+
+// Функция для создания уникального ID звонка
+function generateCallId() {
+   return `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+// Функция для проверки доступности пользователя
+function isUserOnline(userId) {
+   return connectedUsers.has(userId);
+}
+
+// Функция для получения socket пользователя
+function getUserSocket(userId) {
+   const socketId = connectedUsers.get(userId);
+   return socketId ? io.sockets.sockets.get(socketId) : null;
+}
+
+// Функция для отправки события пользователю
+function sendToUser(userId, event, data) {
+   const socket = getUserSocket(userId);
+   if (socket) {
+      try {
+         socket.emit(event, data);
+         console.log(
+            `📤 Sent ${event} to ${userId}:`,
+            JSON.stringify(data).substring(0, 200) + "...",
+         );
+         return true;
+      } catch (error) {
+         console.error(`❌ Error sending ${event} to ${userId}:`, error.message);
+         return false;
+      }
+   }
+   console.log(`❌ User ${userId} not found for event ${event}`);
+   return false;
+}
+
+// Функция для сохранения звонка в историю
+function saveCallToHistory(callData) {
+   try {
+      const { callerId, toUserId, callId } = callData;
+
+      if (!callerId || !toUserId || !callId) {
+         console.error("❌ Invalid call data for history:", callData);
+         return;
+      }
+
+      // Сохраняем для звонящего
+      if (!callHistory.has(callerId)) {
+         callHistory.set(callerId, new Map());
+      }
+      callHistory.get(callerId).set(callId, {
+         ...callData,
+         savedAt: new Date().toISOString(),
+      });
+
+      // Сохраняем для получателя
+      if (!callHistory.has(toUserId)) {
+         callHistory.set(toUserId, new Map());
+      }
+      callHistory.get(toUserId).set(callId, {
+         ...callData,
+         savedAt: new Date().toISOString(),
+      });
+
+      saveCallHistory();
+      console.log(
+         `💾 Call ${callId} saved to history for users ${callerId} and ${toUserId}`,
+      );
+   } catch (error) {
+      console.error("❌ Error saving call to history:", error.message, error.stack);
+   }
+}
+
+// Функция для инициализации звонка - ОБНОВЛЕННАЯ ВЕРСИЯ С PUSH
+function initiateCall(
+   callerId,
+   toUserId,
+   providedCallId,
+   isOfflineCall = false,
+   contactName = null,
+) {
+   try {
+      const callId = providedCallId || generateCallId();
+
+      console.log(
+         `📞 Call initiated from ${callerId} to ${toUserId}, callId: ${callId}${isOfflineCall ? " (OFFLINE CALL)" : ""}`,
+      );
+
+      // Проверяем, не звонят ли самому себе
+      if (callerId === toUserId) {
+         sendToUser(callerId, "call_failed", {
+            callId: callId,
+            error: "Cannot call yourself",
+         });
+         return null;
+      }
+
+      // Создаем информацию о звонке
+      const callInfo = {
+         callerId: callerId,
+         toUserId: toUserId,
+         callId: callId,
+         createdAt: new Date().toISOString(),
+         status: "initiated",
+         isOfflineCall: isOfflineCall,
+         contactName: contactName || toUserId,
+      };
+
+      // Сохраняем звонок в память
+      pendingCalls.set(callId, callInfo);
+
+      // Проверяем онлайн ли получатель
+      if (isUserOnline(toUserId)) {
+         console.log(`✅ User ${toUserId} is online, delivering call immediately`);
+         deliverCall(callId);
+      } else {
+         console.log(`⏳ User ${toUserId} is offline`);
+
+         // ОТПРАВЛЯЕМ PUSH-УВЕДОМЛЕНИЕ
+         console.log(`📱 Sending push notification to offline user ${toUserId}`);
+         sendCallPushNotification(toUserId, callInfo);
+
+         // Устанавливаем таймер ожидания
+         callInfo.timeoutId = setTimeout(() => {
+            handleCallTimeout(callId);
+         }, CALL_WAIT_TIMEOUT);
+
+         // Уведомляем звонящего о том, что пользователь оффлайн
+         const waitingMessage = isOfflineCall
+            ? `Ожидание подключения ${contactName || toUserId}...`
+            : "User is offline, push notification sent";
+
+         sendToUser(callerId, "call_waiting", {
+            callId: callId,
+            toUserId: toUserId,
+            message: waitingMessage,
+            pushSent: true // Сообщаем что push отправлен
+         });
+
+         if (isOfflineCall) {
+            console.log(
+               `📞 Offline call ${callId} initiated - waiting for ${toUserId} to come online`,
+            );
+         }
+      }
+
+      return callId;
+   } catch (error) {
+      console.error("❌ Error initiating call:", error.message, error.stack);
+      return null;
+   }
+}
+
+// Функция для доставки звонка
+function deliverCall(callId) {
+   if (!pendingCalls.has(callId)) {
+      console.log(`❌ Call ${callId} not found for delivery`);
+      return false;
+   }
+
+   const callData = pendingCalls.get(callId);
+   const { toUserId, callerId } = callData;
+
+   // Очищаем таймаут если он был установлен
+   if (callData.timeoutId) {
+      clearTimeout(callData.timeoutId);
+   }
+
+   // Пытаемся отправить звонок получателю
+   const delivered = sendToUser(toUserId, "incoming_call", {
+      fromUserId: callerId,
+      callId: callId,
+   });
+
+   if (delivered) {
+      console.log(`📨 Call ${callId} delivered to ${toUserId}`);
+      callData.status = "delivered";
+      callData.deliveredAt = new Date().toISOString();
+
+      // Уведомляем звонящего об успешной доставке
+      sendToUser(callerId, "call_delivered", {
+         toUserId: toUserId,
+         callId: callId,
+         status: "delivered",
+      });
+
+      return true;
+   } else {
+      console.log(`❌ Failed to deliver call ${callId} to ${toUserId}`);
+      return false;
+   }
+}
+
+// Функция для обработки таймаута звонка
+function handleCallTimeout(callId) {
+   if (pendingCalls.has(callId)) {
+      const callData = pendingCalls.get(callId);
+
+      console.log(`⏰ Call ${callId} expired after ${CALL_WAIT_TIMEOUT}ms`);
+
+      // Сохраняем в историю
+      saveCallToHistory({
+         ...callData,
+         status: "missed",
+         endedAt: new Date().toISOString(),
+         reason: "timeout",
+      });
+
+      // Уведомляем звонящего о неудаче
+      sendToUser(callData.callerId, "call_failed", {
+         callId: callId,
+         toUserId: callData.toUserId,
+         error: "User unavailable",
+         reason: "User did not come online within 60 seconds",
+      });
+
+      // Очищаем звонок из памяти
+      pendingCalls.delete(callId);
+   }
+}
+
+// Функция для обработки подключения пользователя - УЛУЧШЕННАЯ ВЕРСИЯ
+function handleUserConnection(userId) {
+   console.log(`🔍 Checking pending calls for newly connected user ${userId}`);
+
+   // Ищем все ожидающие звонки для этого пользователя
+   const pendingCallIds = Array.from(pendingCalls.entries())
+      .filter(
+         ([callId, callData]) =>
+            callData.toUserId === userId && callData.status === "initiated",
+      )
+      .map(([callId]) => callId);
+
+   if (pendingCallIds.length === 0) {
+      console.log(`📭 No pending calls for user ${userId}`);
+      return;
+   }
+
+   console.log(
+      `📬 Found ${pendingCallIds.length} pending calls for user ${userId}`,
+   );
+
+   // Доставляем каждый ожидающий звонок
+   pendingCallIds.forEach((callId) => {
+      const callData = pendingCalls.get(callId);
+      console.log(
+         `🔄 Attempting to deliver pending call ${callId} to ${userId}${callData.isOfflineCall ? " (OFFLINE CALL)" : ""}`,
+      );
+
+      // Если это оффлайн звонок, уведомляем звонящего о том, что получатель подключился
+      if (callData.isOfflineCall) {
+         sendToUser(callData.callerId, "call_delivered", {
+            toUserId: userId,
+            callId: callId,
+            status: "user_online",
+            message: `${callData.contactName || userId} подключился к серверу`,
+         });
+      }
+
+      deliverCall(callId);
+   });
+}
+
+// Функция для очистки звонка
+function cleanupCall(callId) {
+   if (pendingCalls.has(callId)) {
+      const callData = pendingCalls.get(callId);
+
+      // Очищаем таймеры
+      if (callData.timeoutId) {
+         clearTimeout(callData.timeoutId);
+      }
+
+      // Удаляем из памяти
+      pendingCalls.delete(callId);
+      console.log(`🧹 Call ${callId} cleaned up from memory`);
+   }
+}
+
+// Загружаем историю звонков и FCM токены при старте
+loadCallHistory();
+loadFCMTokens();
+
+// Middleware для логирования
+app.use((req, res, next) => {
+   console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+   next();
+});
+
+// API для работы с сообщениями
+app.get("/messages/:chat_id", (req, res) => {
+   const { chat_id } = req.params;
+
+   if (!chat_id) {
+      return res.status(400).json({
+         status: "Failed",
+         error: "chat_id is required",
+      });
+   }
+
+   const messages = loadMessagesFromFile(chat_id);
+
+   res.json({
+      status: "Success",
+      chat_id: chat_id,
+      messages: messages,
+      total: messages.length,
+   });
+});
+
+app.post("/messages/send", (req, res) => {
+   const { chat_id, time_send, body, fromUserId, toUserId } = req.body;
+
+   if (!chat_id || !time_send || !body) {
+      return res.status(400).json({
+         status: "Failed",
+         error: "chat_id, time_send and body are required",
+      });
+   }
+
+   const messageData = {
+      chat_id: chat_id,
+      time_send: time_send,
+      body: body,
+      fromUserId: fromUserId,
+      toUserId: toUserId,
+      timestamp: new Date().toISOString(),
+      messageId: `${chat_id}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+   };
+
+   // Сохраняем сообщение в файл
+   const saveResult = saveMessageToFile(chat_id, messageData);
+
+   if (!saveResult) {
+      return res.status(500).json({
+         status: "Failed",
+         error: "Failed to save message",
+      });
+   }
+
+   // Если получатель онлайн, отправляем сообщение в реальном времени
+   if (toUserId && connectedUsers.has(toUserId)) {
+      const targetSocketId = connectedUsers.get(toUserId);
+      io.to(targetSocketId).emit("new_message", messageData);
+   }
+
+   // Также уведомляем отправителя если он онлайн
+   if (fromUserId && connectedUsers.has(fromUserId)) {
+      const senderSocketId = connectedUsers.get(fromUserId);
+      io.to(senderSocketId).emit("message_sent", {
+         ...messageData,
+         status: "sent",
+      });
+   }
+
+   console.log(
+      `💬 New message in chat ${chat_id}: ${body.substring(0, 50)}...`,
+   );
+
+   res.json({
+      status: "Success",
+      message: messageData,
+   });
+});
+
+// НОВЫЙ API: Регистрация FCM токена
+app.post("/register-fcm-token", (req, res) => {
+   const { userId, fcmToken } = req.body;
+
+   if (!userId || !fcmToken) {
+      return res.status(400).json({
+         status: "Failed",
+         error: "userId and fcmToken are required",
+      });
+   }
+
+   userFCMTokens.set(userId, fcmToken);
+   saveFCMTokens();
+
+   console.log(`✅ FCM token registered for user ${userId}`);
+
+   res.json({
+      status: "Success",
+      message: "FCM token registered successfully",
+   });
+});
+
+// API для получения истории звонков
+app.get("/call-history/:userId", (req, res) => {
+   const { userId } = req.params;
+
+   if (!userId) {
+      return res.status(400).json({
+         status: "Failed",
+         error: "userId is required",
+      });
+   }
+
+   const userCalls = callHistory.has(userId)
+      ? Array.from(callHistory.get(userId).values())
+      : [];
+
+   res.json({
+      status: "Success",
+      userId: userId,
+      calls: userCalls.sort(
+         (a, b) => new Date(b.createdAt) - new Date(a.createdAt),
+      ),
+      total: userCalls.length,
+   });
+});
+
+// НОВЫЙ API: Получение информации об оффлайн звонках
+app.get("/offline-calls/:userId", (req, res) => {
+   const { userId } = req.params;
+
+   if (!userId) {
+      return res.status(400).json({
+         status: "Failed",
+         error: "userId is required",
+      });
+   }
+
+   // Ищем оффлайн звонки для пользователя
+   const offlineCalls = Array.from(pendingCalls.entries())
+      .filter(
+         ([callId, callData]) =>
+            (callData.callerId === userId || callData.toUserId === userId) &&
+            callData.isOfflineCall === true,
+      )
+      .map(([callId, callData]) => ({
+         callId: callId,
+         callerId: callData.callerId,
+         toUserId: callData.toUserId,
+         contactName: callData.contactName,
+         status: callData.status,
+         createdAt: callData.createdAt,
+         isOfflineCall: callData.isOfflineCall,
+      }));
+
+   res.json({
+      status: "Success",
+      userId: userId,
+      offlineCalls: offlineCalls,
+      total: offlineCalls.length,
+   });
+});
+
+// API для получения списка всех чатов
+app.get("/chats", (req, res) => {
+   const chats = getAllChats();
+
+   // Для каждого чата получаем последнее сообщение и количество сообщений
+   const chatList = chats.map((chat_id) => {
+      const messages = loadMessagesFromFile(chat_id);
+      const lastMessage =
+         messages.length > 0 ? messages[messages.length - 1] : null;
+
+      return {
+         chat_id: chat_id,
+         message_count: messages.length,
+         last_message: lastMessage
+            ? {
+                 body: lastMessage.body,
+                 time_send: lastMessage.time_send,
+                 fromUserId: lastMessage.fromUserId,
+              }
+            : null,
+         created_at: messages.length > 0 ? messages[0].time_send : null,
+      };
+   });
+
+   res.json({
+      status: "Success",
+      chats: chatList,
+      total: chatList.length,
+   });
+});
+
+// Главная страница - отдаем HTML файл
+app.get("/", (req, res) => {
+   res.sendFile(path.join(__dirname, "index.html"));
+});
+
+// HTTP endpoint для проверки подключения
+app.post("/connect", (req, res) => {
+   const { userId } = req.body;
+
+   if (!userId) {
+      console.log(`❌ Failed connection attempt - missing userId`);
+      return res
+         .status(400)
+         .json({ status: "Failed", error: "User ID is required" });
+   }
+
+   console.log(`✅ User ${userId} connected via HTTP`);
+   res.json({ status: "Success", message: "User registered successfully" });
+});
+
+app.get("/status", (req, res) => {
+   const users = Array.from(connectedUsers.keys());
+   const chats = getAllChats();
+   const totalMessages = chats.reduce((acc, chat_id) => {
+      const messages = loadMessagesFromFile(chat_id);
+      return acc + messages.length;
+   }, 0);
+
+   // Статистика по звонкам
+   const allCalls = Array.from(pendingCalls.values());
+   const callStats = {
+      pending: allCalls.filter((call) => call.status === "initiated").length,
+      delivered: allCalls.filter((call) => call.status === "delivered").length,
+      offlineCalls: allCalls.filter((call) => call.isOfflineCall === true)
+         .length,
+      totalHistory: Array.from(callHistory.values()).reduce(
+         (acc, userCalls) => acc + userCalls.size,
+         0,
+      ),
+   };
+
+   // Детальная статистика по оффлайн звонкам
+   const offlineCallStats = {
+      waiting: allCalls.filter(
+         (call) => call.isOfflineCall && call.status === "initiated",
+      ).length,
+      delivered: allCalls.filter(
+         (call) => call.isOfflineCall && call.status === "delivered",
+      ).length,
+   };
+
+   res.json({
+      connectedUsers: users,
+      totalConnected: users.length,
+      callStats: callStats,
+      offlineCallStats: offlineCallStats,
+      chatStats: {
+         totalChats: chats.length,
+         totalMessages: totalMessages,
+      },
+      fcmStats: {
+         registeredTokens: userFCMTokens.size
+      },
+      serverTime: new Date().toISOString(),
+      uptime: process.uptime(),
+   });
+});
+
+// НОВЫЙ API: Получение входящих звонков для пользователя через HTTP
+app.get("/incoming-calls/:userId", (req, res) => {
+   const { userId } = req.params;
+
+   if (!userId) {
+      return res.status(400).json({
+         status: "Failed",
+         error: "userId is required",
+      });
+   }
+
+   try {
+      // Ищем все ожидающие звонки для этого пользователя
+      const incomingCalls = Array.from(pendingCalls.entries())
+         .filter(
+            ([callId, callData]) =>
+               callData.toUserId === userId && 
+               (callData.status === "initiated" || callData.status === "delivered")
+         )
+         .map(([callId, callData]) => ({
+            callId: callId,
+            callerId: callData.callerId,
+            contactName: callData.contactName,
+            status: callData.status,
+            createdAt: callData.createdAt,
+            isOfflineCall: callData.isOfflineCall,
+            // Добавляем временную метку для отслеживания
+            lastChecked: new Date().toISOString()
+         }));
+
+      console.log(`📞 HTTP: Found ${incomingCalls.length} incoming calls for ${userId}`);
+
+      res.json({
+         status: "Success",
+         userId: userId,
+         incomingCalls: incomingCalls,
+         total: incomingCalls.length,
+         timestamp: new Date().toISOString(),
+      });
+   } catch (error) {
+      console.error("❌ Error getting incoming calls:", error.message);
+      res.status(500).json({
+         status: "Failed",
+         error: error.message,
+      });
+   }
+});
+
+// НОВЫЙ API: Завершение звонка через HTTP
+app.post("/call-end", (req, res) => {
+   const { callId, userId } = req.body;
+
+   if (!userId) {
+      return res.status(400).json({
+         status: "Failed",
+         error: "userId is required",
+      });
+   }
+
+   console.log(`📞 HTTP call_end request from user ${userId} for callId: ${callId}`);
+
+   try {
+      let callData = null;
+      let foundCallId = null;
+      let isFromPending = false;
+
+      // Поиск звонка по callId или по участникам
+      if (callId) {
+         // Ищем по префиксу callId
+         for (const [storedCallId, data] of pendingCalls.entries()) {
+            if (storedCallId.startsWith(callId)) {
+               callData = data;
+               foundCallId = storedCallId;
+               isFromPending = true;
+               break;
+            }
+         }
+      } else {
+         // Ищем по участникам звонка (только активные звонки)
+         for (const [storedCallId, data] of pendingCalls.entries()) {
+            if ((data.callerId === userId || data.toUserId === userId) && 
+                data.status !== "ended" && data.status !== "rejected" && data.status !== "missed") {
+               callData = data;
+               foundCallId = storedCallId;
+               isFromPending = true;
+               break;
+            }
+         }
+      }
+
+      if (!callData) {
+         // Ищем в истории звонков
+         for (const [uid, userCalls] of callHistory.entries()) {
+            for (const [storedCallId, data] of userCalls.entries()) {
+               if (callId && storedCallId.startsWith(callId)) {
+                  callData = data;
+                  foundCallId = storedCallId;
+                  break;
+               } else if (!callId && 
+                         (data.callerId === userId || data.toUserId === userId) && 
+                         data.status !== "ended" && data.status !== "rejected" && data.status !== "missed") {
+                  callData = data;
+                  foundCallId = storedCallId;
+                  break;
+               }
+            }
+            if (callData) break;
+         }
+      }
+
+      if (!callData) {
+         console.log(`❌ Call not found for user ${userId}`);
+         return res.status(404).json({
+            status: "Failed",
+            error: "Call not found or already ended",
+         });
+      }
+
+      const { callerId, toUserId } = callData;
+
+      console.log(`📞 Ending call ${foundCallId} between ${callerId} and ${toUserId}`);
+
+      // Сохраняем в историю
+      if (callData.status !== "ended" && callData.status !== "rejected" && callData.status !== "missed") {
+         saveCallToHistory({
+            ...callData,
+            status: "ended",
+            endedAt: new Date().toISOString(),
+            reason: "ended_by_http",
+         });
+      }
+
+      // Уведомляем второе устройство через Socket.IO
+      const otherUserId = userId === callerId ? toUserId : callerId;
+      const sent = sendToUser(otherUserId, "call_ended", {
+         fromUserId: userId,
+         callId: foundCallId,
+      });
+
+      if (sent) {
+         console.log(`✅ Successfully sent call_ended to ${otherUserId}`);
+      } else {
+         console.log(`⚠️ Failed to send call_ended to ${otherUserId} - user may be offline`);
+      }
+
+      // Очищаем из pendingCalls
+      if (isFromPending) {
+         cleanupCall(foundCallId);
+      }
+
+      res.json({
+         status: "Success",
+         message: "Call ended successfully",
+         callId: foundCallId,
+      });
+   } catch (error) {
+      console.error("❌ Error ending call:", error.message);
+      res.status(500).json({
+         status: "Failed",
+         error: error.message,
+      });
+   }
+});
+
+// НОВЫЙ API: Получение статуса отклонения звонка через HTTP
+app.get("/call-status/:callId", (req, res) => {
+   const { callId } = req.params;
+   const { userId } = req.query;
+
+   if (!callId) {
+      return res.status(400).json({
+         status: "Failed",
+         error: "callId is required",
+      });
+   }
+
+   try {
+      console.log(`🔍 Checking call status for: ${callId}`);
+
+      // ✅ ИСПРАВЛЕНИЕ: Ищем звонок по префиксу (callId может содержать timestamp)
+      let callData = null;
+      let foundCallId = null;
+
+      // Сначала ищем в pendingCalls по префиксу
+      for (const [storedCallId, data] of pendingCalls.entries()) {
+         if (storedCallId.startsWith(callId)) {
+            callData = data;
+            foundCallId = storedCallId;
+            console.log(`📞 Found call ${storedCallId} in pending calls with status: ${callData.status}`);
+            break;
+         }
+      }
+
+      if (!callData) {
+         console.log(`📞 Call ${callId} not found in pending calls, searching history...`);
+
+         // ✅ ИСПРАВЛЕНИЕ: Ищем в истории звонков по префиксу
+         for (const [userId, userCalls] of callHistory.entries()) {
+            for (const [storedCallId, data] of userCalls.entries()) {
+               if (storedCallId.startsWith(callId)) {
+                  callData = data;
+                  foundCallId = storedCallId;
+                  console.log(`📞 Found call ${storedCallId} in history for user ${userId}`);
+                  break;
+               }
+            }
+            if (callData) break;
+         }
+
+         if (callData) {
+            console.log(`📞 Found call ${foundCallId} in history with status: ${callData.status}`);
+            return res.json({
+               status: "Success",
+               callId: foundCallId,
+               currentStatus: callData.status,
+               endedAt: callData.endedAt,
+               isActive: false,
+            });
+         }
+
+         // ✅ НОВОЕ: Если не нашли по callId, ищем по участникам звонка
+         if (userId) {
+            console.log(`🔍 Call ${callId} not found by ID, searching by participants...`);
+            console.log(`🔍 Searching for call with participant: ${userId}`);
+
+            // Ищем в pendingCalls по участникам (только активные звонки)
+            for (const [storedCallId, data] of pendingCalls.entries()) {
+               if ((data.callerId === userId || data.toUserId === userId) && 
+                   data.status !== "ended" && data.status !== "rejected" && data.status !== "missed") {
+                  callData = data;
+                  foundCallId = storedCallId;
+                  console.log(`📞 Found active call ${storedCallId} in pending calls by participants: ${data.callerId} <-> ${data.toUserId}`);
+                  break;
+               }
+            }
+
+            // Если не нашли в pendingCalls, ищем в истории (только активные звонки)
+            if (!callData) {
+               for (const [userId, userCalls] of callHistory.entries()) {
+                  for (const [storedCallId, data] of userCalls.entries()) {
+                     if ((data.callerId === userId || data.toUserId === userId) && 
+                         data.status !== "ended" && data.status !== "rejected" && data.status !== "missed") {
+                        callData = data;
+                        foundCallId = storedCallId;
+                        console.log(`📞 Found active call ${storedCallId} in history by participants: ${data.callerId} <-> ${data.toUserId}`);
+                        break;
+                     }
+                  }
+                  if (callData) break;
+               }
+            }
+         }
+
+         if (!callData) {
+            console.log(`❌ Call ${callId} not found in pending calls or history`);
+            return res.status(404).json({
+               status: "Failed",
+               error: "Call not found",
+            });
+         }
+      }
+
+      res.json({
+         status: "Success",
+         callId: foundCallId,
+         currentStatus: callData.status,
+         isActive: true,
+      });
+   } catch (error) {
+      console.error("❌ Error getting call status:", error.message);
+      res.status(500).json({
+         status: "Failed",
+         error: error.message,
+      });
+   }
+});
+
+// Socket.IO соединения
+io.on("connection", (socket) => {
+   console.log(`🔌 New socket connection: ${socket.id}`);
+
+   // Обработка регистрации пользователя
+   socket.on("register", (userId) => {
+      if (!userId) {
+         socket.emit("registration_failed", {
+            error: "User ID is required",
+         });
+         return;
+      }
+
+      // УДАЛЯЕМ ПРОВЕРКУ НА ДУБЛИКАТ - разрешаем переподключение
+      // Удаляем старую запись если пользователь переподключается
+      if (connectedUsers.has(userId)) {
+         console.log(`🔄 User ${userId} reconnected, updating socket ID`);
+         const oldSocketId = connectedUsers.get(userId);
+         const oldSocket = io.sockets.sockets.get(oldSocketId);
+         if (oldSocket && oldSocket !== socket) {
+            oldSocket.disconnect(true); // Отключаем старый сокет
+         }
+      }
+
+      // Сохраняем связь между socket.id и userId
+      connectedUsers.set(userId, socket.id);
+      socket.userId = userId;
+
+      console.log(`✅ User ${userId} registered with socket ${socket.id}`);
+
+      // Проверяем и доставляем ожидающие звонки для этого пользователя
+      handleUserConnection(userId);
+
+      socket.emit("registration_success", {
+         status: "Success",
+         userId: userId,
+         connectedUsers: Array.from(connectedUsers.keys()).filter(
+            (id) => id !== userId,
+         ),
+      });
+
+      // Уведомляем всех о новом пользователе
+      socket.broadcast.emit("user_connected", { userId });
+
+      console.log(`📊 Total connected users: ${connectedUsers.size}`);
+   });
+
+   // Регистрация FCM токена через WebSocket
+   socket.on("register_fcm_token", (data) => {
+      const { fcmToken } = data;
+      const userId = socket.userId;
+
+      if (!userId || !fcmToken) {
+         socket.emit("fcm_token_failed", {
+            error: "User ID and FCM token are required",
+         });
+         return;
+      }
+
+      userFCMTokens.set(userId, fcmToken);
+      saveFCMTokens();
+
+      console.log(`✅ FCM token registered for user ${userId}`);
+      socket.emit("fcm_token_success", {
+         status: "Success",
+         message: "FCM token registered successfully",
+      });
+   });
+
+   // Отправка сообщения через WebSocket
+   socket.on("send_message", (data) => {
+      const { chat_id, time_send, body, toUserId } = data;
+      const fromUserId = socket.userId;
+
+      if (!chat_id || !time_send || !body) {
+         socket.emit("message_failed", {
+            error: "chat_id, time_send and body are required",
+         });
+         return;
+      }
+
+      const messageData = {
+         chat_id: chat_id,
+         time_send: time_send,
+         body: body,
+         fromUserId: fromUserId,
+         toUserId: toUserId,
+         timestamp: new Date().toISOString(),
+         messageId: `${chat_id}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      };
+
+      // Сохраняем сообщение в файл
+      const saveResult = saveMessageToFile(chat_id, messageData);
+
+      if (!saveResult) {
+         socket.emit("message_failed", {
+            error: "Failed to save message",
+         });
+         return;
+      }
+
+      // Подтверждение отправителю
+      socket.emit("message_sent", {
+         ...messageData,
+         status: "sent",
+      });
+
+      // Если получатель онлайн, отправляем сообщение в реальном времени
+      if (toUserId && connectedUsers.has(toUserId)) {
+         const targetSocketId = connectedUsers.get(toUserId);
+         io.to(targetSocketId).emit("new_message", messageData);
+      }
+
+      console.log(
+         `💬 New message in chat ${chat_id} from ${fromUserId}: ${body.substring(0, 50)}...`,
+      );
+   });
+
+   // Загрузка истории чата
+   socket.on("load_chat_history", (data) => {
+      const { chat_id } = data;
+
+      if (!chat_id) {
+         socket.emit("chat_history_error", {
+            error: "chat_id is required",
+         });
+         return;
+      }
+
+      const messages = loadMessagesFromFile(chat_id);
+
+      socket.emit("chat_history_loaded", {
+         chat_id: chat_id,
+         messages: messages,
+         total: messages.length,
+      });
+
+      console.log(
+         `📂 Sent ${messages.length} messages from ${chat_id} to user ${socket.userId}`,
+      );
+   });
+
+   // ИСПРАВЛЕНО: Инициализация звонка с правильной обработкой fromUserId
+   socket.on("initiate_call", (data) => {
+      const { toUserId, callId: clientCallId, isOfflineCall, contactName, fromUserId: providedFromUserId } = data;
+
+      // ИСПРАВЛЕНО: Используем providedFromUserId если он есть, иначе socket.userId
+      const fromUserId = providedFromUserId || socket.userId;
+
+      if (!fromUserId || !toUserId) {
+         socket.emit("call_failed", {
+            error: "fromUserId and toUserId are required",
+         });
+         return;
+      }
+
+      // ИСПРАВЛЕНО: Проверяем что providedFromUserId совпадает с socket.userId (если он был предоставлен)
+      if (providedFromUserId && providedFromUserId !== socket.userId) {
+         socket.emit("call_failed", {
+            error: "Authentication failed: userId mismatch",
+         });
+         return;
+      }
+
+      console.log(
+         `📞 Initiating call from ${fromUserId} to ${toUserId}${isOfflineCall ? " (OFFLINE CALL)" : ""}`,
+      );
+
+      const callId = initiateCall(
+         fromUserId,
+         toUserId,
+         clientCallId,
+         isOfflineCall,
+         contactName,
+      );
+
+      if (!callId) {
+         // Ошибка уже обработана в initiateCall
+         return;
+      }
+
+      // Дополнительная обработка для оффлайн звонков уже включена в initiateCall
+      if (isOfflineCall) {
+         console.log(
+            `📞 Offline call ${callId} initiated - waiting for ${toUserId} to come online`,
+         );
+      }
+
+      console.log(`📞 Call ${callId} initiated successfully`);
+   });
+
+   // Обработка принятия звонка
+   socket.on("accept_call", (data) => {
+      const { callId } = data;
+      const toUserId = socket.userId;
+
+      if (!pendingCalls.has(callId)) {
+         socket.emit("call_failed", {
+            error: "Call not found",
+         });
+         return;
+      }
+
+      const callData = pendingCalls.get(callId);
+      const { callerId } = callData;
+
+      console.log(
+         `✅ Call accepted by ${toUserId} from ${callerId}, callId: ${callId}`,
+      );
+
+      // Уведомляем звонящего о принятии
+      sendToUser(callerId, "call_accepted", {
+         toUserId: toUserId,
+         callId: callId,
+      });
+
+      // Очищаем звонок из систем ожидания
+      cleanupCall(callId);
+   });
+
+   // Обработка отклонения звонка
+   socket.on("reject_call", (data) => {
+      const { callId } = data;
+      const toUserId = socket.userId;
+
+      let callData = null;
+      let isFromPending = false;
+
+      // ✅ ИСПРАВЛЕНИЕ: Ищем звонок по префиксу (callId может содержать timestamp)
+      let foundCallId = null;
+
+      // Сначала ищем в pendingCalls по префиксу
+      for (const [storedCallId, data] of pendingCalls.entries()) {
+         if (storedCallId.startsWith(callId)) {
+            callData = data;
+            foundCallId = storedCallId;
+            isFromPending = true;
+            console.log(`📞 Found call ${storedCallId} in pending calls for rejection`);
+            break;
+         }
+      }
+
+      if (!callData) {
+         // ✅ НОВОЕ: Ищем в истории звонков по префиксу
+         console.log(`🔍 Call ${callId} not in pending, searching in history...`);
+
+         for (const [userId, userCalls] of callHistory.entries()) {
+            for (const [storedCallId, data] of userCalls.entries()) {
+               if (storedCallId.startsWith(callId)) {
+                  callData = data;
+                  foundCallId = storedCallId;
+                  console.log(`📞 Found call ${storedCallId} in history for user ${userId}`);
+                  break;
+               }
+            }
+            if (callData) break;
+         }
+      }
+
+      // ✅ НОВОЕ: Если не нашли по callId, ищем по участникам звонка
+      if (!callData) {
+         console.log(`🔍 Call ${callId} not found by ID, searching by participants...`);
+         console.log(`🔍 Searching for call between ${toUserId} and other participants`);
+
+         // Ищем в pendingCalls по участникам (только активные звонки)
+         for (const [storedCallId, data] of pendingCalls.entries()) {
+            if ((data.callerId === toUserId || data.toUserId === toUserId) && 
+                data.status !== "ended" && data.status !== "rejected" && data.status !== "missed") {
+               callData = data;
+               foundCallId = storedCallId;
+               isFromPending = true;
+               console.log(`📞 Found active call ${storedCallId} in pending calls by participants: ${data.callerId} <-> ${data.toUserId}`);
+               break;
+            }
+         }
+
+         // Если не нашли в pendingCalls, ищем в истории (только активные звонки)
+         if (!callData) {
+            for (const [userId, userCalls] of callHistory.entries()) {
+               for (const [storedCallId, data] of userCalls.entries()) {
+                  if ((data.callerId === toUserId || data.toUserId === toUserId) && 
+                      data.status !== "ended" && data.status !== "rejected" && data.status !== "missed") {
+                     callData = data;
+                     foundCallId = storedCallId;
+                     console.log(`📞 Found active call ${storedCallId} in history by participants: ${data.callerId} <-> ${data.toUserId}`);
+                     break;
+                  }
+               }
+               if (callData) break;
+            }
+         }
+      }
+
+      if (!callData) {
+         console.log(`❌ Call ${callId} not found in pending calls or history for rejection`);
+         socket.emit("call_failed", {
+            error: "Call not found",
+         });
+         return;
+      }
+
+      const { callerId } = callData;
+
+      console.log(
+         `❌ Call rejected by ${toUserId} from ${callerId}, callId: ${foundCallId}`,
+      );
+
+      // ✅ ИСПРАВЛЕНИЕ: Сохраняем в историю только если звонок еще не был отклонен
+      if (callData.status !== "rejected" && callData.status !== "ended" && callData.status !== "missed") {
+         saveCallToHistory({
+            ...callData,
+            status: "rejected",
+            endedAt: new Date().toISOString(),
+            reason: "rejected_by_user",
+         });
+         console.log(`💾 Call ${foundCallId} status updated to 'rejected' in history`);
+      } else {
+         console.log(`📞 Call ${foundCallId} was already ${callData.status}, skipping history update`);
+      }
+
+      // Уведомляем звонящего об отклонении
+      console.log(`📤 Attempting to send call_rejected to callerId: ${callerId}`);
+      const sent = sendToUser(callerId, "call_rejected", {
+         fromUserId: toUserId,
+         callId: foundCallId,
+      });
+
+      // ✅ НОВОЕ: Отправляем дополнительное сообщение с ID и статусом
+      console.log(`📤 Attempting to send call_status_update to callerId: ${callerId}`);
+      const statusSent = sendToUser(callerId, "call_status_update", {
+         callId: foundCallId,
+         status: "прекращен",
+         fromUserId: toUserId,
+         reason: "rejected_by_user",
+         timestamp: new Date().toISOString()
+      });
+
+      if (sent) {
+         console.log(`✅ Successfully sent call_rejected to ${callerId}`);
+      } else {
+         console.log(`⚠️ Failed to send call_rejected to ${callerId} - user may be offline, call will be tracked via HTTP polling`);
+      }
+
+      if (statusSent) {
+         console.log(`✅ Successfully sent call_status_update to ${callerId}`);
+      } else {
+         console.log(`⚠️ Failed to send call_status_update to ${callerId}`);
+      }
+
+      // ✅ ИСПРАВЛЕНИЕ: Очищаем звонок только если он был в pendingCalls
+      if (isFromPending) {
+         cleanupCall(foundCallId);
+      } else {
+         console.log(`📞 Call ${foundCallId} was already processed, skipping cleanup`);
+      }
+   });
+
+   // Обработка завершения звонка
+   socket.on("end_call", (data) => {
+      const { callId } = data;
+      const fromUserId = socket.userId;
+
+      let callData = null;
+      let isFromPending = false;
+
+      // ✅ ИСПРАВЛЕНИЕ: Ищем звонок по префиксу (callId может содержать timestamp)
+      let foundCallId = null;
+
+      // Сначала ищем в pendingCalls по префиксу
+      for (const [storedCallId, data] of pendingCalls.entries()) {
+         if (storedCallId.startsWith(callId)) {
+            callData = data;
+            foundCallId = storedCallId;
+            isFromPending = true;
+            console.log(`📞 Found call ${storedCallId} in pending calls`);
+            break;
+         }
+      }
+
+      if (!callData) {
+         // ✅ НОВОЕ: Ищем в истории звонков по префиксу
+         console.log(`🔍 Call ${callId} not in pending, searching in history...`);
+
+         for (const [userId, userCalls] of callHistory.entries()) {
+            for (const [storedCallId, data] of userCalls.entries()) {
+               if (storedCallId.startsWith(callId)) {
+                  callData = data;
+                  foundCallId = storedCallId;
+                  console.log(`📞 Found call ${storedCallId} in history for user ${userId}`);
+                  break;
+               }
+            }
+            if (callData) break;
+         }
+      }
+
+      // ✅ НОВОЕ: Если не нашли по callId, ищем по участникам звонка
+      if (!callData) {
+         console.log(`🔍 Call ${callId} not found by ID, searching by participants...`);
+         console.log(`🔍 Searching for call between ${fromUserId} and other participants`);
+
+         // Ищем в pendingCalls по участникам (только активные звонки)
+         for (const [storedCallId, data] of pendingCalls.entries()) {
+            if ((data.callerId === fromUserId || data.toUserId === fromUserId) && 
+                data.status !== "ended" && data.status !== "rejected" && data.status !== "missed") {
+               callData = data;
+               foundCallId = storedCallId;
+               isFromPending = true;
+               console.log(`📞 Found active call ${storedCallId} in pending calls by participants: ${data.callerId} <-> ${data.toUserId}`);
+               break;
+            }
+         }
+
+         // Если не нашли в pendingCalls, ищем в истории (только активные звонки)
+         if (!callData) {
+            for (const [userId, userCalls] of callHistory.entries()) {
+               for (const [storedCallId, data] of userCalls.entries()) {
+                  if ((data.callerId === fromUserId || data.toUserId === fromUserId) && 
+                      data.status !== "ended" && data.status !== "rejected" && data.status !== "missed") {
+                     callData = data;
+                     foundCallId = storedCallId;
+                     console.log(`📞 Found active call ${storedCallId} in history by participants: ${data.callerId} <-> ${data.toUserId}`);
+                     break;
+                  }
+               }
+               if (callData) break;
+            }
+         }
+      }
+
+      if (!callData) {
+         console.log(`❌ Call ${callId} not found in pending calls or history`);
+         return;
+      }
+
+      const { callerId, toUserId } = callData;
+
+      console.log(
+         `📞 Call ended between ${callerId} and ${toUserId}, callId: ${foundCallId}`,
+      );
+
+      // ✅ ИСПРАВЛЕНИЕ: Сохраняем в историю только если звонок еще не был завершен
+      if (callData.status !== "ended" && callData.status !== "rejected" && callData.status !== "missed") {
+         saveCallToHistory({
+            ...callData,
+            status: "ended",
+            endedAt: new Date().toISOString(),
+            reason: "ended_by_user",
+         });
+         console.log(`💾 Call ${callId} status updated to 'ended' in history`);
+      } else {
+         console.log(`📞 Call ${callId} was already ${callData.status}, skipping history update`);
+      }
+
+      // Уведомляем другую сторону
+      const otherUserId = fromUserId === callerId ? toUserId : callerId;
+      console.log(`📤 Attempting to send call_ended to otherUserId: ${otherUserId}`);
+      const sent = sendToUser(otherUserId, "call_ended", {
+         fromUserId: fromUserId,
+         callId: foundCallId,
+      });
+
+      // ✅ НОВОЕ: Отправляем дополнительное сообщение с ID и статусом
+      console.log(`📤 Attempting to send call_status_update to otherUserId: ${otherUserId}`);
+      const statusSent = sendToUser(otherUserId, "call_status_update", {
+         callId: foundCallId,
+         status: "прекращен",
+         fromUserId: fromUserId,
+         reason: "ended_by_user",
+         timestamp: new Date().toISOString()
+      });
+
+      if (sent) {
+         console.log(`✅ Successfully sent call_ended to ${otherUserId}`);
+      } else {
+         console.log(`⚠️ Failed to send call_ended to ${otherUserId} - user may be offline, call will be tracked via HTTP polling`);
+      }
+
+      if (statusSent) {
+         console.log(`✅ Successfully sent call_status_update to ${otherUserId}`);
+      } else {
+         console.log(`⚠️ Failed to send call_status_update to ${otherUserId}`);
+      }
+
+      // ✅ ИСПРАВЛЕНИЕ: Очищаем звонок только если он был в pendingCalls
+      if (isFromPending) {
+         cleanupCall(foundCallId);
+      } else {
+         console.log(`📞 Call ${foundCallId} was already processed, skipping cleanup`);
+      }
+   });
+
+   // WebRTC signaling - универсальный обработчик
+   socket.on("webrtc_signal", (data) => {
+      const { type, toUserId, sdp, candidate, callId } = data;
+      const fromUserId = socket.userId;
+
+      console.log(
+         `📨 WebRTC signal: ${type} from ${fromUserId} to ${toUserId}, callId: ${callId}`,
+      );
+
+      if (!type || !toUserId) {
+         console.log(`❌ Invalid webrtc_signal: missing type or toUserId`);
+         return;
+      }
+
+      const signalData = {
+         type: type,
+         fromUserId: fromUserId,
+         callId: callId,
+      };
+
+      // Добавляем соответствующие данные в зависимости от типа
+      if (sdp) {
+         signalData.sdp = sdp;
+      }
+
+      // Обработка ICE кандидатов
+      if (candidate && type === "ice_candidate") {
+         console.log(
+            "🔍 DEBUG: Processing ICE candidate:",
+            JSON.stringify(candidate).substring(0, 200),
+         );
+
+         if (
+            candidate.candidate &&
+            candidate.sdpMid !== undefined &&
+            candidate.sdpMLineIndex !== undefined
+         ) {
+            signalData.candidate = candidate;
+         } else if (candidate.sdp) {
+            signalData.candidate = {
+               sdpMid: candidate.sdpMid || "0",
+               sdpMLineIndex: candidate.sdpMLineIndex || 0,
+               candidate: candidate.sdp,
+            };
+         } else {
+            signalData.candidate = {
+               sdpMid: "0",
+               sdpMLineIndex: 0,
+               candidate: candidate.candidate || JSON.stringify(candidate),
+            };
+         }
+
+         console.log(
+            "✅ DEBUG: Final ICE candidate structure:",
+            JSON.stringify(signalData.candidate),
+         );
+      }
+
+      const delivered = sendToUser(toUserId, "webrtc_signal", signalData);
+
+      if (delivered) {
+         console.log(`✅ WebRTC signal ${type} delivered to ${toUserId}`);
+      } else {
+         console.log(`❌ Failed to deliver WebRTC signal to ${toUserId}`);
+      }
+   });
+
+   // WebRTC ICE candidates (старый обработчик для обратной совместимости)
+   socket.on("webrtc_ice_candidate", (data) => {
+      const { toUserId, candidate, callId } = data;
+
+      console.log(
+         `🔍 DEBUG: webrtc_ice_candidate from ${socket.userId} to ${toUserId}, callId: ${callId}`,
+      );
+
+      const iceCandidateData = {
+         fromUserId: socket.userId,
+         callId: callId,
+      };
+
+      if (candidate) {
+         console.log(
+            "🔍 DEBUG: Old ICE candidate structure:",
+            JSON.stringify(candidate).substring(0, 200),
+         );
+
+         if (typeof candidate === "string") {
+            iceCandidateData.candidate = {
+               sdpMid: "0",
+               sdpMLineIndex: 0,
+               candidate: candidate,
+            };
+         } else if (candidate.candidate && candidate.sdpMid !== undefined) {
+            iceCandidateData.candidate = candidate;
+         } else if (candidate.candidate) {
+            iceCandidateData.candidate = {
+               sdpMid: candidate.sdpMid || "0",
+               sdpMLineIndex: candidate.sdpMLineIndex || 0,
+               candidate: candidate.candidate,
+            };
+         } else {
+            iceCandidateData.candidate = {
+               sdpMid: "0",
+               sdpMLineIndex: 0,
+               candidate: JSON.stringify(candidate),
+            };
+         }
+
+         console.log(
+            "✅ DEBUG: Final old ICE candidate structure:",
+            JSON.stringify(iceCandidateData.candidate),
+         );
+      }
+
+      const delivered = sendToUser(
+         toUserId,
+         "webrtc_ice_candidate",
+         iceCandidateData,
+      );
+
+      if (delivered) {
+         console.log(`✅ ICE candidate delivered to ${toUserId}`);
+      } else {
+         console.log(`❌ Failed to deliver ICE candidate to ${toUserId}`);
+      }
+   });
+
+   // Обработка отключения пользователя
+   socket.on("disconnect", () => {
+      if (socket.userId) {
+         console.log(`🔴 User ${socket.userId} disconnected`);
+         connectedUsers.delete(socket.userId);
+
+         // Уведомляем всех о отключении пользователя
+         socket.broadcast.emit("user_disconnected", {
+            userId: socket.userId,
+         });
+
+         console.log(`📊 Total connected users: ${connectedUsers.size}`);
+      }
+   });
+});
+
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+   console.log(`🚀 Signaling server running on port ${PORT}`);
+   console.log(`💬 File-based messaging system: ENABLED`);
+   console.log(`📞 New call delivery system: ENABLED`);
+   console.log(`📞 Offline call support: ENABLED`);
+   console.log(`📱 Push notifications for calls: ENABLED`);
+   console.log(`⏰ Call wait timeout: ${CALL_WAIT_TIMEOUT / 1000} seconds`);
+   console.log(`📁 Chats storage: ${MESSAGES_DIR}`);
+   console.log(`💾 Call history: ${CALL_HISTORY_FILE}`);
+   console.log(`🔑 FCM tokens: ${FCM_TOKENS_FILE}`);
+   console.log(`🕒 Server started at: ${new Date().toISOString()}`);
+   console.log("=========================================");
+});
+
+// Обработка graceful shutdown
+process.on("SIGINT", () => {
+   console.log("🛑 Shutting down server...");
+   console.log(`📊 Pending calls: ${pendingCalls.size}`);
+   console.log(`💾 Saving call history and FCM tokens...`);
+   saveCallHistory();
+   saveFCMTokens();
+   console.log("✅ All data saved successfully");
+
+   // Очищаем все таймеры
+   for (const [callId, callData] of pendingCalls.entries()) {
+      if (callData.timeoutId) {
+         clearTimeout(callData.timeoutId);
+      }
+   }
+
+   server.close(() => {
+      console.log("✅ Server closed");
+      process.exit(0);
+   });
+});

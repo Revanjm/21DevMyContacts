@@ -1,0 +1,560 @@
+<!doctype html>
+<html>
+    <head>
+        <title>WebRTC Signaling Server</title>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
+                color: #333;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 15px;
+                box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+                overflow: hidden;
+            }
+            .header {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 30px;
+                text-align: center;
+            }
+            .header h1 {
+                font-size: 2.5em;
+                margin-bottom: 10px;
+                font-weight: 300;
+            }
+            .header p {
+                font-size: 1.2em;
+                opacity: 0.9;
+            }
+            .status {
+                background: #f8f9fa;
+                padding: 20px;
+                border-bottom: 1px solid #e9ecef;
+            }
+            .status-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 20px;
+                margin-bottom: 20px;
+            }
+            .status-card {
+                background: white;
+                padding: 20px;
+                border-radius: 10px;
+                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
+                text-align: center;
+            }
+            .status-card h3 {
+                color: #6c757d;
+                font-size: 0.9em;
+                margin-bottom: 10px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .status-card .value {
+                font-size: 2em;
+                font-weight: bold;
+                color: #495057;
+            }
+            .status-card.connected .value {
+                color: #28a745;
+            }
+            .status-card.pending .value {
+                color: #ffc107;
+            }
+            .status-card.messages .value {
+                color: #17a2b8;
+            }
+            .status-card.chats .value {
+                color: #e83e8c;
+            }
+            .status-card.devices .value {
+                color: #28a745;
+            }
+            .users-section,
+            .devices-section,
+            .chats-section {
+                padding: 30px;
+            }
+            .section-title {
+                color: #495057;
+                margin-bottom: 20px;
+                font-weight: 400;
+                border-bottom: 2px solid #e9ecef;
+                padding-bottom: 10px;
+            }
+            .users-grid,
+            .devices-grid,
+            .chats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+                gap: 15px;
+            }
+            .user-card,
+            .device-card,
+            .chat-card {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+                transition:
+                    transform 0.3s ease,
+                    box-shadow 0.3s ease;
+                position: relative;
+            }
+            .user-card:hover,
+            .device-card:hover,
+            .chat-card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+            }
+            .device-card {
+                background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+                cursor: pointer;
+            }
+            .device-card:hover {
+                background: linear-gradient(135deg, #dc3545 0%, #fd7e14 100%);
+            }
+            .device-delete-btn {
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                background: rgba(255, 255, 255, 0.2);
+                border: none;
+                color: white;
+                width: 30px;
+                height: 30px;
+                border-radius: 50%;
+                cursor: pointer;
+                font-size: 16px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: background 0.3s ease;
+            }
+            .device-delete-btn:hover {
+                background: rgba(255, 255, 255, 0.3);
+            }
+            .user-id,
+            .chat-id {
+                font-weight: bold;
+                font-size: 1.1em;
+                word-break: break-all;
+                margin-bottom: 10px;
+            }
+            .online-dot {
+                display: inline-block;
+                width: 10px;
+                height: 10px;
+                background: #28a745;
+                border-radius: 50%;
+                margin-right: 8px;
+            }
+            .empty-state {
+                text-align: center;
+                padding: 40px;
+                color: #6c757d;
+            }
+            .empty-state i {
+                font-size: 3em;
+                margin-bottom: 20px;
+                opacity: 0.5;
+            }
+            .server-info {
+                background: #e9ecef;
+                padding: 20px;
+                text-align: center;
+                border-top: 1px solid #dee2e6;
+            }
+            .message-preview {
+                font-size: 0.9em;
+                opacity: 0.9;
+                margin-top: 5px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🎯 WebRTC Signaling Server</h1>
+                <p>Real-time voice call and messaging server</p>
+            </div>
+
+            <div class="status">
+                <div class="status-grid">
+                    <div class="status-card connected">
+                        <h3>Connected Users</h3>
+                        <div class="value" id="connectedUsersCount">0</div>
+                    </div>
+                    <div class="status-card pending">
+                        <h3>Pending Calls</h3>
+                        <div class="value" id="pendingCallsCount">0</div>
+                    </div>
+                    <div class="status-card chats">
+                        <h3>Active Chats</h3>
+                        <div class="value" id="activeChatsCount">0</div>
+                    </div>
+                    <div class="status-card messages">
+                        <h3>Total Messages</h3>
+                        <div class="value" id="totalMessagesCount">0</div>
+                    </div>
+                    <div class="status-card devices">
+                        <h3>Connected Devices</h3>
+                        <div class="value" id="connectedDevicesCount">0</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="users-section">
+                <h2 class="section-title">
+                    <span class="online-dot"></span>
+                    Currently Connected Users (<span id="connectedUsersTitle"
+                        >0</span
+                    >)
+                </h2>
+                <div id="usersContainer">
+                    <div class="empty-state">
+                        <div>📞</div>
+                        <h3>No users connected</h3>
+                        <p>
+                            Users will appear here when they connect to the
+                            server
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="devices-section">
+                <h2 class="section-title">
+                    📱 Connected Devices (<span id="connectedDevicesTitle">0</span>)
+                </h2>
+                <div id="devicesContainer">
+                    <div class="empty-state">
+                        <div>📱</div>
+                        <h3>No devices connected</h3>
+                        <p>Devices will appear here when they connect to the server</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="chats-section">
+                <h2 class="section-title">
+                    💬 Active Chats (<span id="activeChatsTitle">0</span>)
+                </h2>
+                <div id="chatsContainer">
+                    <div class="empty-state">
+                        <div>💬</div>
+                        <h3>No chats yet</h3>
+                        <p>Chats will appear here when messages are sent</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="server-info">
+                <p>
+                    <strong>Server URL:</strong>
+                    <span id="serverUrl">Loading...</span>
+                </p>
+                <p>
+                    <strong>Port:</strong> <span id="serverPort">3000</span> |
+                    <strong>Node.js:</strong>
+                    <span id="nodeVersion">Loading...</span>
+                </p>
+                <p>
+                    <strong>Features:</strong> WebRTC Calls • Real-time
+                    Messaging • File-based Chat Storage
+                </p>
+                <p>
+                    <strong>Last Updated:</strong>
+                    <span id="lastUpdate">Never</span>
+                </p>
+            </div>
+        </div>
+
+        <!-- Socket.IO клиент -->
+        <script src="/socket.io/socket.io.js"></script>
+        <script>
+            // WebSocket подключение для получения обновлений в реальном времени
+            let socket;
+            
+            function connectWebSocket() {
+                socket = io();
+                
+                socket.on('connect', () => {
+                    console.log('✅ Connected to server via WebSocket');
+                });
+                
+                socket.on('user_list_update', (data) => {
+                    console.log('📢 Received user list update:', data);
+                    updateUserList(data.userList);
+                });
+                
+                socket.on('device_list_update', (data) => {
+                    console.log('📱 Received device list update:', data);
+                    updateDeviceList(data.deviceDetails);
+                });
+                
+                socket.on('user_disconnected', (data) => {
+                    console.log('👤 User disconnected:', data.userId);
+                    // Обновляем список пользователей
+                    loadStatus();
+                });
+                
+                socket.on('disconnect', () => {
+                    console.log('❌ Disconnected from server');
+                    // ❌ ОТКЛЮЧЕНО: Автоматическое переподключение
+                    // setTimeout(() => {
+                    //     console.log('🔄 Attempting to reconnect...');
+                    //     connectWebSocket();
+                    // }, 3000);
+                });
+                
+                socket.on('connect_error', (error) => {
+                    console.error('❌ WebSocket connection error:', error);
+                });
+            }
+            
+            function updateUserList(userList) {
+                const usersContainer = document.getElementById("usersContainer");
+                const connectedUsersCount = document.getElementById("connectedUsersCount");
+                const connectedUsersTitle = document.getElementById("connectedUsersTitle");
+                
+                // Обновляем счетчики
+                connectedUsersCount.textContent = userList.length;
+                connectedUsersTitle.textContent = userList.length;
+                
+                // Обновляем список пользователей
+                if (userList.length > 0) {
+                    usersContainer.innerHTML = `
+                        <div class="users-grid">
+                            ${userList.map(userId => `
+                                <div class="user-card">
+                                    <div class="user-id">${userId}</div>
+                                </div>
+                            `).join("")}
+                        </div>
+                    `;
+                } else {
+                    usersContainer.innerHTML = `
+                        <div class="empty-state">
+                            <div>📞</div>
+                            <h3>No users connected</h3>
+                            <p>Users will appear here when they connect to the server</p>
+                        </div>
+                    `;
+                }
+            }
+
+            function updateDeviceList(deviceDetails) {
+                const devicesContainer = document.getElementById("devicesContainer");
+                const connectedDevicesCount = document.getElementById("connectedDevicesCount");
+                const connectedDevicesTitle = document.getElementById("connectedDevicesTitle");
+                
+                // Обновляем счетчики
+                connectedDevicesCount.textContent = deviceDetails.length;
+                connectedDevicesTitle.textContent = deviceDetails.length;
+                
+                // Обновляем список устройств
+                if (deviceDetails.length > 0) {
+                    devicesContainer.innerHTML = `
+                        <div class="devices-grid">
+                            ${deviceDetails.map(device => `
+                                <div class="device-card" onclick="deleteDevice('${device.deviceId}')">
+                                    <button class="device-delete-btn" onclick="event.stopPropagation(); deleteDevice('${device.deviceId}')" title="Удалить устройство">×</button>
+                                    <div class="device-id">${device.deviceId}</div>
+                                    <div class="device-user">User: ${device.userId}</div>
+                                    <div class="device-time">Connected: ${new Date(device.connectedAt).toLocaleString()}</div>
+                                </div>
+                            `).join("")}
+                        </div>
+                    `;
+                } else {
+                    devicesContainer.innerHTML = `
+                        <div class="empty-state">
+                            <div>📱</div>
+                            <h3>No devices connected</h3>
+                            <p>Devices will appear here when they connect to the server</p>
+                        </div>
+                    `;
+                }
+            }
+
+            // Функция для удаления устройства
+            async function deleteDevice(deviceId) {
+                if (!confirm(`Вы уверены, что хотите удалить устройство ${deviceId}?`)) {
+                    return;
+                }
+
+                try {
+                    const response = await fetch(`/api/devices/${deviceId}`, {
+                        method: 'DELETE',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+
+                    const result = await response.json();
+
+                    if (result.success) {
+                        console.log(`✅ Device ${deviceId} deleted successfully`);
+                        // Обновляем список устройств
+                        loadDevices();
+                    } else {
+                        console.error(`❌ Failed to delete device ${deviceId}:`, result.error);
+                        alert(`Ошибка при удалении устройства: ${result.error}`);
+                    }
+                } catch (error) {
+                    console.error(`❌ Error deleting device ${deviceId}:`, error);
+                    alert(`Ошибка при удалении устройства: ${error.message}`);
+                }
+            }
+
+            // Функция для загрузки списка устройств
+            async function loadDevices() {
+                try {
+                    const response = await fetch("/api/devices");
+                    const data = await response.json();
+
+                    if (data.success) {
+                        updateDeviceList(data.deviceDetails);
+                    } else {
+                        console.error("❌ Failed to load devices:", data.error);
+                    }
+                } catch (error) {
+                    console.error("❌ Error loading devices:", error);
+                }
+            }
+
+            // Функция для загрузки данных статуса
+            async function loadStatus() {
+                try {
+                    const response = await fetch("/status");
+                    const data = await response.json();
+
+                    // Обновляем счетчики
+                    document.getElementById("connectedUsersCount").textContent =
+                        data.totalConnected;
+                    document.getElementById("pendingCallsCount").textContent =
+                        data.pendingCalls;
+                    document.getElementById("activeChatsCount").textContent =
+                        data.chatStats.totalChats;
+                    document.getElementById("totalMessagesCount").textContent =
+                        data.chatStats.totalMessages;
+                    document.getElementById("connectedUsersTitle").textContent =
+                        data.totalConnected;
+                    document.getElementById("activeChatsTitle").textContent =
+                        data.chatStats.totalChats;
+
+                    // Обновляем список пользователей
+                    const usersContainer =
+                        document.getElementById("usersContainer");
+                    if (data.connectedUsers.length > 0) {
+                        usersContainer.innerHTML = `
+                        <div class="users-grid">
+                            ${data.connectedUsers
+                                .map(
+                                    (userId) => `
+                                <div class="user-card">
+                                    <div class="user-id">${userId}</div>
+                                </div>
+                            `,
+                                )
+                                .join("")}
+                        </div>
+                    `;
+                    } else {
+                        usersContainer.innerHTML = `
+                        <div class="empty-state">
+                            <div>📞</div>
+                            <h3>No users connected</h3>
+                            <p>Users will appear here when they connect to the server</p>
+                        </div>
+                    `;
+                    }
+
+                    // Загружаем список чатов
+                    const chatsResponse = await fetch("/chats");
+                    const chatsData = await chatsResponse.json();
+
+                    const chatsContainer =
+                        document.getElementById("chatsContainer");
+                    if (chatsData.chats.length > 0) {
+                        chatsContainer.innerHTML = `
+                        <div class="chats-grid">
+                            ${chatsData.chats
+                                .map(
+                                    (chat) => `
+                                <div class="chat-card">
+                                    <div class="chat-id">${chat.chat_id}</div>
+                                    <div>Messages: ${chat.message_count}</div>
+                                    ${
+                                        chat.last_message
+                                            ? `
+                                        <div class="message-preview">Last: ${chat.last_message.body.substring(0, 30)}...</div>
+                                    `
+                                            : ""
+                                    }
+                                </div>
+                            `,
+                                )
+                                .join("")}
+                        </div>
+                    `;
+                    } else {
+                        chatsContainer.innerHTML = `
+                        <div class="empty-state">
+                            <div>💬</div>
+                            <h3>No chats yet</h3>
+                            <p>Chats will appear here when messages are sent</p>
+                        </div>
+                    `;
+                    }
+
+                    // Обновляем информацию о сервере
+                    document.getElementById("serverUrl").textContent =
+                        window.location.origin;
+                    document.getElementById("serverPort").textContent =
+                        window.location.port || 80;
+                    document.getElementById("nodeVersion").textContent =
+                        "Node.js";
+                    document.getElementById("lastUpdate").textContent =
+                        new Date().toLocaleString();
+                } catch (error) {
+                    console.error("Error loading status:", error);
+                }
+            }
+
+                    // Загружаем данные при загрузке страницы
+            document.addEventListener("DOMContentLoaded", () => {
+                loadStatus();
+                loadDevices();
+                connectWebSocket();
+            });
+
+            // Авто-обновление каждые 5 секунд (как fallback)
+            setInterval(() => {
+                loadStatus();
+                loadDevices();
+            }, 5000);
+        </script>
+    </body>
+</html>

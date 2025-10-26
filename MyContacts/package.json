@@ -1,0 +1,24 @@
+{
+  "name": "mycontacts-server",
+  "version": "1.0.0",
+  "description": "MyContacts signaling server with modular architecture",
+  "main": "app/src/main/java/com/ppnkdeapp/mycontacts/network/server.js",
+  "scripts": {
+    "start": "node app/src/main/java/com/ppnkdeapp/mycontacts/network/server.js",
+    "dev": "nodemon app/src/main/java/com/ppnkdeapp/mycontacts/network/server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": ["signaling", "webrtc", "messaging", "contacts"],
+  "author": "MyContacts Team",
+  "license": "MIT"
+}

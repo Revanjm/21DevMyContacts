@@ -1,0 +1,19 @@
+# Replit configuration for MyContacts Server
+[run]
+language = "nodejs"
+run = "npm start"
+
+[deployment]
+run = ["sh", "-c", "npm start"]
+deploymentTarget = "cloudrun"
+
+[env]
+NODE_ENV = "production"
+PORT = "3000"
+
+[gitHubImport]
+requiredFiles = [".replit", "package.json", "app/src/main/java/com/ppnkdeapp/mycontacts/network/server.js"]
+
+[deployment]
+run = ["sh", "-c", "npm start"]
+deploymentTarget = "cloudrun"
